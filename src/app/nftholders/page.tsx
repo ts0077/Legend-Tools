@@ -37,7 +37,7 @@ export default function NftHoldersFetch() {
 
             } while (pageKey);
 
-            // Remove duplicate addresses
+           
             const uniqueHolders = [...new Set(allHolders)];
 
             setHolders(uniqueHolders);
