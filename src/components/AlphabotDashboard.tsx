@@ -26,13 +26,34 @@ interface ResultRaffle {
   enteries: number
   reason: string | null
   error: string | null
+  resultMd: string | null
   enteredTime: string
 }
 
-type StatusTab = "all" | "pending" | "successful" | "failed"
+interface FullRaffle {
+  slug: string
+  name: string
+  endDate: number
+  status: "entered" | "failed" | "queued" | "not_attempted"
+  reason: string | null
+  entries: number
+}
+
+type StatusTab = "all" | "pending" | "successful" | "failed" | "community"
 type GroupMode = "project" | "server"
 
-const LAST_SEEN_KEY = "alphabot_last_seen_at"
+const SEEN_KEY = "alphabot_seen_map_v2"
+
+function loadSeenMap(): Record<string, number> {
+  if (typeof window === "undefined") return {}
+  try {
+    const raw = localStorage.getItem(SEEN_KEY)
+    if (raw) return JSON.parse(raw)
+  } catch {}
+  const initial = { global: Date.now() }
+  localStorage.setItem(SEEN_KEY, JSON.stringify(initial))
+  return initial
+}
 
 export default function AlphabotDashboard() {
   const [pending, setPending] = useState<PendingRaffle[]>([])
@@ -43,11 +64,15 @@ export default function AlphabotDashboard() {
   const [activeTab, setActiveTab] = useState<StatusTab>("all")
   const [loading, setLoading] = useState(true)
   const [reenteringSlug, setReenteringSlug] = useState<string | null>(null)
-  const [lastSeenAt, setLastSeenAt] = useState<number>(0)
+  const [seenMap, setSeenMap] = useState<Record<string, number>>({})
+  const [etaSeconds, setEtaSeconds] = useState<number | null>(null)
+  const [search, setSearch] = useState("")
+  const [fullList, setFullList] = useState<FullRaffle[] | null>(null)
+  const [fullListLoading, setFullListLoading] = useState(false)
+  const [queueingSlug, setQueueingSlug] = useState<string | null>(null)
 
   useEffect(() => {
-    const stored = typeof window !== "undefined" ? localStorage.getItem(LAST_SEEN_KEY) : null
-    setLastSeenAt(stored ? parseInt(stored, 10) : Date.now())
+    setSeenMap(loadSeenMap())
   }, [])
 
   const fetchAll = useCallback(async () => {
@@ -73,7 +98,31 @@ export default function AlphabotDashboard() {
     return () => clearInterval(interval)
   }, [fetchAll])
 
-  const handleReenter = async (r: { slug: string; raffleName?: string | null; name?: string; projectId: string | null; projectName: string | null; teamId: string | null; serverName: string | null }) => {
+  useEffect(() => {
+    const fetchEta = async () => {
+      try {
+        const res = await axios.get(`${baseurl}/api/Raffles/queue/eta`)
+        setEtaSeconds(res.data.secondsRemaining)
+      } catch {}
+    }
+    fetchEta()
+    const interval = setInterval(fetchEta, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  const fetchFullList = async () => {
+    setFullListLoading(true)
+    try {
+      const res = await axios.get(`${baseurl}/api/Raffles/queue/full`)
+      setFullList(res.data)
+    } catch (err) {
+      console.error(err)
+    } finally {
+      setFullListLoading(false)
+    }
+  }
+
+  const handleReenter = async (r: { slug: string; raffleName?: string | null; name?: string; projectId: string | null; projectName: string | null; teamId?: string | null; serverName?: string | null }) => {
     setReenteringSlug(r.slug)
     try {
       await axios.post(`${baseurl}/api/Raffles/reenter/${r.slug}`, null, {
@@ -91,10 +140,37 @@ export default function AlphabotDashboard() {
     }
   }
 
+  const handleAddToQueue = async (r: FullRaffle) => {
+    setQueueingSlug(r.slug)
+    try {
+      await axios.post(`${baseurl}/api/Raffles/queue/add/${r.slug}`, null, {
+        params: { name: r.name, endDate: r.endDate },
+      })
+      await fetchAll()
+      await fetchFullList()
+    } finally {
+      setQueueingSlug(null)
+    }
+  }
+
+  const persistSeenMap = (map: Record<string, number>) => {
+    localStorage.setItem(SEEN_KEY, JSON.stringify(map))
+    setSeenMap(map)
+  }
+
+  const markGroupRead = (key: string) => {
+    const mapKey = `${groupMode}:${key}`
+    persistSeenMap({ ...seenMap, [mapKey]: Date.now() })
+  }
+
   const markAllRead = () => {
-    const now = Date.now()
-    localStorage.setItem(LAST_SEEN_KEY, String(now))
-    setLastSeenAt(now)
+    persistSeenMap({ global: Date.now() })
+  }
+
+  const isNew = (ts: string | number, key: string) => {
+    const mapKey = `${groupMode}:${key}`
+    const threshold = seenMap[mapKey] ?? seenMap.global ?? 0
+    return new Date(ts).getTime() > threshold
   }
 
   const shortId = (id: string) => (id && id.length > 10 ? `${id.slice(0, 8)}…` : id)
@@ -115,36 +191,30 @@ export default function AlphabotDashboard() {
   }
 
   const groupIds = useMemo(() => {
-    const keyOf = (r: { projectId: string | null; teamId?: string | null }) => groupKey(r)
-    return Array.from(new Set([...pending, ...successful, ...failed].map(keyOf))).filter(Boolean)
+    return Array.from(new Set([...pending, ...successful, ...failed].map(groupKey))).filter(Boolean)
   }, [pending, successful, failed, groupMode])
 
   const inGroup = <T extends { projectId: string | null; teamId?: string | null }>(list: T[]) =>
     activeGroup === "all" ? list : list.filter((r) => groupKey(r) === activeGroup)
 
-  const gPending = inGroup(pending).slice().sort((a, b) => a.endDate - b.endDate)
-  const gSuccessful = inGroup(successful)
-  const gFailed = inGroup(failed)
-
-  const totalEntered = successful.reduce((sum, r) => sum + (r.enteries || 0), 0)
-
-  const timeLeft = (endDate: number) => {
-    const diff = endDate - Date.now()
-    if (diff <= 0) return "ended"
-    const mins = Math.floor(diff / 60000)
-    return mins < 60 ? `${mins}m` : `${Math.floor(mins / 60)}h ${mins % 60}m`
+  const matchesSearch = (title: string, slug: string) => {
+    if (!search.trim()) return true
+    const q = search.toLowerCase()
+    return title.toLowerCase().includes(q) || slug.toLowerCase().includes(q)
   }
 
-  const isNew = (ts: string | number) => new Date(ts).getTime() > lastSeenAt
+  const gPending = inGroup(pending).filter((r) => matchesSearch(r.name, r.slug)).slice().sort((a, b) => a.endDate - b.endDate)
+  const gSuccessful = inGroup(successful).filter((r) => matchesSearch(r.raffleName ?? r.slug, r.slug))
+  const gFailed = inGroup(failed).filter((r) => matchesSearch(r.raffleName ?? r.slug, r.slug))
 
   const newCountFor = (key: string) => {
     const scoped = key === "all"
       ? { p: pending, s: successful, f: failed }
       : { p: pending.filter(r => groupKey(r) === key), s: successful.filter(r => groupKey(r) === key), f: failed.filter(r => groupKey(r) === key) }
     return (
-      scoped.p.filter(r => isNew(r.createdAt)).length +
-      scoped.s.filter(r => isNew(r.enteredTime)).length +
-      scoped.f.filter(r => isNew(r.enteredTime)).length
+      scoped.p.filter(r => isNew(r.createdAt, key)).length +
+      scoped.s.filter(r => isNew(r.enteredTime, key)).length +
+      scoped.f.filter(r => isNew(r.enteredTime, key)).length
     )
   }
 
@@ -158,40 +228,50 @@ export default function AlphabotDashboard() {
   const totalNew = newCountFor("all")
 
   type MergedRow = {
-    key: string
-    title: string
-    slug: string
-    status: "pending" | "entered" | "failed"
-    groupLabel: string
-    timestamp: number
-    entries?: number
-    reason?: string | null
-    raw: any
+    key: string; title: string; slug: string; status: "pending" | "entered" | "failed"
+    groupLabel: string; groupId: string; timestamp: number; entries?: number; reason?: string | null
   }
 
   const mergedAll: MergedRow[] = useMemo(() => {
     const rows: MergedRow[] = []
     gPending.forEach((r) => rows.push({
-      key: `p-${r.id}`, title: r.name, slug: r.slug, status: "pending",
+      key: `p-${r.id}`, title: r.name, slug: r.slug, status: "pending", groupId: groupKey(r),
       groupLabel: groupMode === "project" ? (r.projectName || shortId(r.projectId)) : (r.serverName || shortId(r.teamId ?? "")),
-      timestamp: new Date(r.createdAt).getTime(), raw: r,
+      timestamp: new Date(r.createdAt).getTime(),
     }))
     gSuccessful.forEach((r, i) => rows.push({
-      key: `s-${r.slug}-${i}`, title: r.raffleName ?? r.slug, slug: r.slug, status: "entered",
+      key: `s-${r.slug}-${i}`, title: r.raffleName ?? r.slug, slug: r.slug, status: "entered", groupId: groupKey(r),
       groupLabel: groupMode === "project" ? (r.projectName || shortId(r.projectId ?? "")) : (r.serverName || shortId(r.teamId ?? "")),
-      timestamp: new Date(r.enteredTime).getTime(), entries: r.enteries, raw: r,
+      timestamp: new Date(r.enteredTime).getTime(), entries: r.enteries,
     }))
     gFailed.forEach((r, i) => rows.push({
-      key: `f-${r.slug}-${i}`, title: r.raffleName ?? r.slug, slug: r.slug, status: "failed",
+      key: `f-${r.slug}-${i}`, title: r.raffleName ?? r.slug, slug: r.slug, status: "failed", groupId: groupKey(r),
       groupLabel: groupMode === "project" ? (r.projectName || shortId(r.projectId ?? "")) : (r.serverName || shortId(r.teamId ?? "")),
-      timestamp: new Date(r.enteredTime).getTime(), reason: r.reason || r.error, raw: r,
+      timestamp: new Date(r.enteredTime).getTime(), reason: r.resultMd || r.reason || r.error,
     }))
     return rows.sort((a, b) => b.timestamp - a.timestamp)
   }, [gPending, gSuccessful, gFailed, groupMode])
 
+  const dayLabel = (ts: number) => new Date(ts).toLocaleDateString(undefined, { year: "numeric", month: "long", day: "numeric" })
+
+  const withDateSeparators = <T extends { timestamp: number }>(rows: T[]) => {
+    const out: (T | { separator: string })[] = []
+    let lastDay = ""
+    rows.forEach((r) => {
+      const day = dayLabel(r.timestamp)
+      if (day !== lastDay) {
+        out.push({ separator: day })
+        lastDay = day
+      }
+      out.push(r)
+    })
+    return out
+  }
+
   const statusBar = { pending: "bg-amber-400", entered: "bg-emerald-400", failed: "bg-rose-400" }
   const statusText = { pending: "text-amber-400", entered: "text-emerald-400", failed: "text-rose-400" }
-  const statusLabel = { pending: "pending", entered: "entered", failed: "failed" }
+
+  const fullListFiltered = (fullList ?? []).filter((r) => matchesSearch(r.name, r.slug))
 
   return (
     <div className="min-h-screen bg-[#0E0F13] text-[#E7E8ED] font-sans">
@@ -202,8 +282,9 @@ export default function AlphabotDashboard() {
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
             live
           </span>
-          {totalNew > 0 && (
-            <span className="text-xs bg-[#7C6CF0] text-white px-1.5 py-0.5 rounded-full font-mono">{totalNew} new</span>
+          {totalNew > 0 && <span className="text-xs bg-[#7C6CF0] text-white px-1.5 py-0.5 rounded-full font-mono">{totalNew} new</span>}
+          {etaSeconds !== null && pending.length > 0 && (
+            <span className="text-xs text-[#8A8E9C] font-mono">next entry in {etaSeconds}s</span>
           )}
         </div>
         <div className="flex items-center gap-4">
@@ -211,12 +292,9 @@ export default function AlphabotDashboard() {
             <Stat label="pending" value={pending.length} />
             <Stat label="entered" value={successful.length} />
             <Stat label="failed" value={failed.length} />
-            <Stat label="total entries" value={totalEntered} />
+            <Stat label="total entries" value={successful.reduce((s, r) => s + (r.enteries || 0), 0)} />
           </div>
-          <button
-            onClick={markAllRead}
-            className="text-xs border border-[#242730] px-2.5 py-1.5 text-[#8A8E9C] hover:text-[#E7E8ED] hover:border-[#3a3d47] transition-colors shrink-0"
-          >
+          <button onClick={markAllRead} className="text-xs border border-[#242730] px-2.5 py-1.5 text-[#8A8E9C] hover:text-[#E7E8ED] hover:border-[#3a3d47] transition-colors shrink-0">
             mark all as read
           </button>
         </div>
@@ -224,13 +302,8 @@ export default function AlphabotDashboard() {
 
       <div className="flex gap-1 px-6 pt-3 border-b border-[#242730]">
         {(["project", "server"] as GroupMode[]).map((m) => (
-          <button
-            key={m}
-            onClick={() => { setGroupMode(m); setActiveGroup("all") }}
-            className={`px-3 py-1.5 text-xs rounded-t transition-colors ${
-              groupMode === m ? "bg-[#15171E] text-[#E7E8ED]" : "text-[#8A8E9C] hover:text-[#E7E8ED]"
-            }`}
-          >
+          <button key={m} onClick={() => { setGroupMode(m); setActiveGroup("all") }}
+            className={`px-3 py-1.5 text-xs rounded-t transition-colors ${groupMode === m ? "bg-[#15171E] text-[#E7E8ED]" : "text-[#8A8E9C] hover:text-[#E7E8ED]"}`}>
             {m === "project" ? "By project" : "By alpha server"}
           </button>
         ))}
@@ -238,88 +311,86 @@ export default function AlphabotDashboard() {
 
       <div className="flex flex-col md:flex-row">
         <div className="w-full md:w-60 shrink-0 border-b md:border-b-0 md:border-r border-[#242730] overflow-x-auto md:overflow-x-visible md:h-[calc(100vh-113px)] md:overflow-y-auto flex md:block">
-          <button
-            onClick={() => setActiveGroup("all")}
-            className={`shrink-0 text-left px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 transition-colors whitespace-nowrap ${
-              activeGroup === "all" ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
-            }`}
-          >
-            all {groupMode === "project" ? "projects" : "servers"}
-            <span className="font-mono text-xs opacity-60 ml-2">{groupCount("all")}</span>
-          </button>
+          <div className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap ${activeGroup === "all" ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
+            <button onClick={() => setActiveGroup("all")} className="hover:text-[#E7E8ED]">
+              all {groupMode === "project" ? "projects" : "servers"}
+              <span className="font-mono text-xs opacity-60 ml-2">{groupCount("all")}</span>
+            </button>
+          </div>
           {groupIds.map((key) => {
             const n = newCountFor(key)
             return (
-              <button
-                key={key}
-                onClick={() => setActiveGroup(key)}
-                className={`shrink-0 text-left px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 transition-colors whitespace-nowrap flex items-center gap-2 ${
-                  activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
-                }`}
-              >
-                {groupLabel(key)}
-                <span className="font-mono text-xs opacity-60">{groupCount(key)}</span>
-                {n > 0 && <span className="text-[10px] bg-[#7C6CF0] text-white px-1 rounded-full font-mono">{n}</span>}
-              </button>
+              <div key={key} className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap ${activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
+                <button onClick={() => setActiveGroup(key)} className="hover:text-[#E7E8ED] flex items-center gap-2">
+                  {groupLabel(key)}
+                  <span className="font-mono text-xs opacity-60">{groupCount(key)}</span>
+                  {n > 0 && <span className="text-[10px] bg-[#7C6CF0] text-white px-1 rounded-full font-mono">{n}</span>}
+                </button>
+                {n > 0 && (
+                  <button onClick={() => markGroupRead(key)} className="text-[10px] text-[#8A8E9C] hover:text-[#E7E8ED] ml-2">read</button>
+                )}
+              </div>
             )
           })}
         </div>
 
         <div className="flex-1 min-w-0">
-          <div className="flex gap-6 px-6 pt-4 border-b border-[#242730]">
-            {(["all", "pending", "successful", "failed"] as StatusTab[]).map((tab) => (
-              <button
-                key={tab}
-                onClick={() => setActiveTab(tab)}
-                className={`pb-3 text-sm capitalize border-b-2 transition-colors ${
-                  activeTab === tab ? "border-[#7C6CF0] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
-                }`}
-              >
-                {tab}
+          <div className="flex gap-6 px-6 pt-4 border-b border-[#242730] overflow-x-auto">
+            {(["all", "pending", "successful", "failed", "community"] as StatusTab[]).map((tab) => (
+              <button key={tab} onClick={() => { setActiveTab(tab); if (tab === "community" && !fullList) fetchFullList() }}
+                className={`pb-3 text-sm capitalize border-b-2 transition-colors whitespace-nowrap ${activeTab === tab ? "border-[#7C6CF0] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"}`}>
+                {tab === "community" ? "Community raffles" : tab}
               </button>
             ))}
+          </div>
+
+          <div className="px-6 pt-3">
+            <input
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder="search by name or slug…"
+              className="w-full max-w-sm bg-[#15171E] border border-[#242730] text-sm px-3 py-1.5 rounded focus:outline-none focus:border-[#7C6CF0]"
+            />
           </div>
 
           {loading ? (
             <p className="px-6 py-10 text-sm text-[#8A8E9C]">loading…</p>
           ) : activeTab === "all" ? (
-            mergedAll.length === 0 ? (
-              <p className="px-6 py-10 text-sm text-[#8A8E9C]">nothing here right now</p>
-            ) : (
+            mergedAll.length === 0 ? <p className="px-6 py-10 text-sm text-[#8A8E9C]">nothing here right now</p> : (
               <div className="divide-y divide-[#242730]">
-                {mergedAll.map((row) => (
-                  <div key={row.key} className="flex items-stretch">
-                    <div className={`w-1 ${statusBar[row.status]}`} />
-                    <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
-                      <div className="min-w-0 flex items-center gap-2">
-                        {isNew(row.timestamp) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
-                        <div className="min-w-0">
-                          <p className="text-sm truncate">{row.title}</p>
-                          <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
-                            {row.groupLabel} · {row.slug} · {new Date(row.timestamp).toLocaleString()}
-                          </p>
-                          {row.reason && <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{row.reason}</p>}
+                {withDateSeparators(mergedAll).map((row, idx) =>
+                  "separator" in row ? (
+                    <div key={`sep-${idx}`} className="px-5 py-2 text-xs text-[#8A8E9C] bg-[#15171E] sticky top-0">{row.separator}</div>
+                  ) : (
+                    <div key={row.key} className="flex items-stretch">
+                      <div className={`w-1 ${statusBar[row.status]}`} />
+                      <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
+                        <div className="min-w-0 flex items-center gap-2">
+                          {isNew(row.timestamp, row.groupId) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
+                          <div className="min-w-0">
+                            <p className="text-sm truncate">{row.title}</p>
+                            <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">{row.groupLabel} · {row.slug} · {new Date(row.timestamp).toLocaleTimeString()}</p>
+                            {row.reason && <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{row.reason}</p>}
+                          </div>
                         </div>
+                        <span className={`text-xs font-mono shrink-0 ${statusText[row.status]}`}>
+                          {row.status}{row.entries != null ? ` · ${row.entries} entries` : ""}
+                        </span>
                       </div>
-                      <span className={`text-xs font-mono shrink-0 ${statusText[row.status]}`}>
-                        {statusLabel[row.status]}{row.entries != null ? ` · ${row.entries} entries` : ""}
-                      </span>
                     </div>
-                  </div>
-                ))}
+                  )
+                )}
               </div>
             )
           ) : activeTab === "pending" ? (
-            gPending.length === 0 ? (
-              <p className="px-6 py-10 text-sm text-[#8A8E9C]">no pending raffles</p>
-            ) : (
+            gPending.length === 0 ? <p className="px-6 py-10 text-sm text-[#8A8E9C]">no pending raffles</p> : (
               <div className="divide-y divide-[#242730]">
                 {gPending.map((r) => (
                   <div key={r.id} className="flex items-stretch">
                     <div className={`w-1 ${statusBar.pending}`} />
                     <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
                       <div className="min-w-0 flex items-center gap-2">
-                        {isNew(r.createdAt) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
+                        {isNew(r.createdAt, groupKey(r)) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
                         <div className="min-w-0">
                           <p className="text-sm truncate">{r.name}</p>
                           <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
@@ -327,38 +398,12 @@ export default function AlphabotDashboard() {
                           </p>
                         </div>
                       </div>
-                      <p className="text-xs font-mono text-amber-400 shrink-0">{timeLeft(r.endDate)} left</p>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )
-          ) : activeTab === "successful" ? (
-            gSuccessful.length === 0 ? (
-              <p className="px-6 py-10 text-sm text-[#8A8E9C]">no successful entries yet</p>
-            ) : (
-              <div className="divide-y divide-[#242730]">
-                {gSuccessful.map((r, i) => (
-                  <div key={`${r.slug}-${i}`} className="flex items-stretch">
-                    <div className={`w-1 ${statusBar.entered}`} />
-                    <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
-                      <div className="min-w-0 flex items-center gap-2">
-                        {isNew(r.enteredTime) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
-                        <div className="min-w-0">
-                          <p className="text-sm truncate">{r.raffleName ?? r.slug}</p>
-                          <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
-                            {groupMode === "project" ? (r.projectName || shortId(r.projectId ?? "")) : (r.serverName || shortId(r.teamId ?? ""))} · {new Date(r.enteredTime).toLocaleString()}
-                          </p>
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-4 shrink-0">
-                        <span className="text-xs font-mono text-emerald-400">{r.enteries} entries</span>
-                        <button
-                          onClick={() => handleReenter(r)}
+                      <div className="flex items-center gap-3 shrink-0">
+                        <p className="text-xs font-mono text-amber-400">{Math.max(0, Math.floor((r.endDate - Date.now()) / 60000))}m left</p>
+                        <button onClick={() => handleReenter({ slug: r.slug, name: r.name, projectId: r.projectId, projectName: r.projectName, teamId: r.teamId, serverName: r.serverName })}
                           disabled={reenteringSlug === r.slug}
-                          className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40"
-                        >
-                          {reenteringSlug === r.slug ? "…" : "re-enter"}
+                          className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40">
+                          {reenteringSlug === r.slug ? "…" : "enter now"}
                         </button>
                       </div>
                     </div>
@@ -366,37 +411,104 @@ export default function AlphabotDashboard() {
                 ))}
               </div>
             )
-          ) : (
-            gFailed.length === 0 ? (
-              <p className="px-6 py-10 text-sm text-[#8A8E9C]">no failed entries</p>
-            ) : (
+          ) : activeTab === "successful" ? (
+            gSuccessful.length === 0 ? <p className="px-6 py-10 text-sm text-[#8A8E9C]">no successful entries yet</p> : (
               <div className="divide-y divide-[#242730]">
-                {gFailed.map((r, i) => (
-                  <div key={`${r.slug}-${i}`} className="flex items-stretch">
-                    <div className={`w-1 ${statusBar.failed}`} />
-                    <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
-                      <div className="min-w-0 flex items-center gap-2">
-                        {isNew(r.enteredTime) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
-                        <div className="min-w-0">
-                          <p className="text-sm truncate">{r.raffleName ?? r.slug}</p>
-                          <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
-                            {groupMode === "project" ? (r.projectName || shortId(r.projectId ?? "")) : (r.serverName || shortId(r.teamId ?? ""))} · {new Date(r.enteredTime).toLocaleString()}
-                          </p>
-                          {(r.reason || r.error) && <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{r.reason || r.error}</p>}
+                {withDateSeparators(gSuccessful.map((r, i) => ({ ...r, timestamp: new Date(r.enteredTime).getTime(), _i: i }))).map((row, idx) =>
+                  "separator" in row ? (
+                    <div key={`sep-${idx}`} className="px-5 py-2 text-xs text-[#8A8E9C] bg-[#15171E]">{row.separator}</div>
+                  ) : (
+                    <div key={`${row.slug}-${row._i}`} className="flex items-stretch">
+                      <div className={`w-1 ${statusBar.entered}`} />
+                      <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
+                        <div className="min-w-0 flex items-center gap-2">
+                          {isNew(row.enteredTime, groupKey(row)) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
+                          <div className="min-w-0">
+                            <p className="text-sm truncate">{row.raffleName ?? row.slug}</p>
+                            <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
+                              {groupMode === "project" ? (row.projectName || shortId(row.projectId ?? "")) : (row.serverName || shortId(row.teamId ?? ""))} · {new Date(row.enteredTime).toLocaleTimeString()}
+                            </p>
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-4 shrink-0">
+                          <span className="text-xs font-mono text-emerald-400">{row.enteries} entries</span>
+                          <button onClick={() => handleReenter(row)} disabled={reenteringSlug === row.slug} className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40">
+                            {reenteringSlug === row.slug ? "…" : "re-enter"}
+                          </button>
                         </div>
                       </div>
-                      <button
-                        onClick={() => handleReenter(r)}
-                        disabled={reenteringSlug === r.slug}
-                        className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40 shrink-0"
-                      >
-                        {reenteringSlug === r.slug ? "…" : "re-enter"}
-                      </button>
                     </div>
-                  </div>
-                ))}
+                  )
+                )}
               </div>
             )
+          ) : activeTab === "failed" ? (
+            gFailed.length === 0 ? <p className="px-6 py-10 text-sm text-[#8A8E9C]">no failed entries</p> : (
+              <div className="divide-y divide-[#242730]">
+                {withDateSeparators(gFailed.map((r, i) => ({ ...r, timestamp: new Date(r.enteredTime).getTime(), _i: i }))).map((row, idx) =>
+                  "separator" in row ? (
+                    <div key={`sep-${idx}`} className="px-5 py-2 text-xs text-[#8A8E9C] bg-[#15171E]">{row.separator}</div>
+                  ) : (
+                    <div key={`${row.slug}-${row._i}`} className="flex items-stretch">
+                      <div className={`w-1 ${statusBar.failed}`} />
+                      <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
+                        <div className="min-w-0 flex items-center gap-2">
+                          {isNew(row.enteredTime, groupKey(row)) && <span className="w-1.5 h-1.5 rounded-full bg-[#7C6CF0] shrink-0" />}
+                          <div className="min-w-0">
+                            <p className="text-sm truncate">{row.raffleName ?? row.slug}</p>
+                            <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
+                              {groupMode === "project" ? (row.projectName || shortId(row.projectId ?? "")) : (row.serverName || shortId(row.teamId ?? ""))} · {new Date(row.enteredTime).toLocaleTimeString()}
+                            </p>
+                            {(row.resultMd || row.reason || row.error) && <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{row.resultMd || row.reason || row.error}</p>}
+                          </div>
+                        </div>
+                        <button onClick={() => handleReenter(row)} disabled={reenteringSlug === row.slug} className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40 shrink-0">
+                          {reenteringSlug === row.slug ? "…" : "retry"}
+                        </button>
+                      </div>
+                    </div>
+                  )
+                )}
+              </div>
+            )
+          ) : (
+            <div>
+              <div className="px-5 py-3 flex items-center justify-between border-b border-[#242730]">
+                <p className="text-xs text-[#8A8E9C]">Full unregistered raffle list from Alphabot — fetch manually, not auto-refreshed (rate limited).</p>
+                <button onClick={fetchFullList} disabled={fullListLoading} className="text-xs border border-[#242730] px-2.5 py-1.5 text-[#8A8E9C] hover:text-[#E7E8ED] disabled:opacity-40">
+                  {fullListLoading ? "fetching…" : "refresh list"}
+                </button>
+              </div>
+              {fullListFiltered.length === 0 ? (
+                <p className="px-6 py-10 text-sm text-[#8A8E9C]">{fullList === null ? "click refresh to load" : "nothing matches"}</p>
+              ) : (
+                <div className="divide-y divide-[#242730]">
+                  {fullListFiltered.map((r) => (
+                    <div key={r.slug} className="flex items-stretch">
+                      <div className={`w-1 ${r.status === "entered" ? statusBar.entered : r.status === "failed" ? statusBar.failed : r.status === "queued" ? statusBar.pending : "bg-[#3a3d47]"}`} />
+                      <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
+                        <div className="min-w-0">
+                          <p className="text-sm truncate">{r.name}</p>
+                          <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">{r.slug}</p>
+                          {r.reason && <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{r.reason}</p>}
+                        </div>
+                        <div className="flex items-center gap-3 shrink-0">
+                          <span className={`text-xs font-mono ${r.status === "entered" ? "text-emerald-400" : r.status === "failed" ? "text-rose-400" : r.status === "queued" ? "text-amber-400" : "text-[#8A8E9C]"}`}>
+                            {r.status.replace("_", " ")}{r.entries ? ` · ${r.entries} entries` : ""}
+                          </span>
+                          {r.status === "not_attempted" && (
+                            <button onClick={() => handleAddToQueue(r)} disabled={queueingSlug === r.slug}
+                              className="text-xs border border-[#242730] px-2 py-1 text-[#8A8E9C] hover:text-[#E7E8ED] disabled:opacity-40">
+                              {queueingSlug === r.slug ? "…" : "add to queue"}
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>
