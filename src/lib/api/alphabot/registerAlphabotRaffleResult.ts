@@ -6,9 +6,9 @@ export interface raffleRegisterResultProps {
 validationSuccess:boolean
 enteries:number
 slug:string
-reason: string
-resultMd:string
-error:string
+reason?: string
+resultMd?:string
+error?:string
 }
 
 export default async function AlphabotRafflesRegisterResultApi ( data:raffleRegisterResultProps){
