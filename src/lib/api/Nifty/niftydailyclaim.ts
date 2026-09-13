@@ -5,7 +5,7 @@ import { baseAlphabotUrl, baseurl } from "../baseurl";
 
 export default async function ANiftyDailyClaimApi (){
                 const alphabotKey = baseAlphabotUrl
-                const url = baseurl + "https://niftyshield.org/api/daily/claim" 
+                const url =  "https://niftyshield.org/api/daily/claim" 
     try{
                     const res = await axios.post(url,
                            {},

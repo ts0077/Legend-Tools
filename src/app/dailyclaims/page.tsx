@@ -1,95 +1,26 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef } from "react";
-import ANiftyDailyClaimApi from "@/lib/api/Nifty/niftydailyclaim";
-// ^ adjust this import path to wherever ANiftyDailyClaimApi actually lives
-//   in your project (e.g. "../../api/nifty/ANiftyDailyClaimApi").
+import { baseurl } from "@/lib/api/baseurl";
+// ^ adjust this import path to wherever baseurl.ts actually lives relative
+//   to this page (e.g. "../../lib/api/baseurl").
 
 // ---------------------------------------------------------------------------
-// Config — add one entry per project here when you wire up more claims.
-// Each claim only needs a stable id, a display name/description, and the
-// async function that performs the claim call.
+// Data shape — matches GET /api/AutoClaim/status
 // ---------------------------------------------------------------------------
 
-type ClaimApiFn = () => Promise<unknown>;
-
-interface ClaimConfig {
-  id: string;
-  name: string;
-  description: string;
-  api: ClaimApiFn;
+interface AutoClaimStatus {
+  id: number;
+  projectName: string;
+  nextClaimAt: string | null;
+  lastClaimAt: string | null;
+  lastStreak: number | null;
+  lastReward: number | null;
+  lastStatus: "Success" | "Failed" | null;
+  lastError: string | null;
 }
 
-const CLAIMS: ClaimConfig[] = [
-  {
-    id: "nifty-shield-daily",
-    name: "NiftyShield",
-    description: "Daily claim",
-    api: ANiftyDailyClaimApi,
-  },
-  // {
-  //   id: "another-project-daily",
-  //   name: "Another Project",
-  //   description: "Daily claim",
-  //   api: AnotherProjectClaimApi,
-  // },
-];
-
-// ---------------------------------------------------------------------------
-// Timing rules
-//
-// A claim window is not exactly 24h after the last one — a random amount of
-// extra minutes is tacked on each time so the schedule keeps drifting and
-// never lands on the same clock time twice in a row.
-// ---------------------------------------------------------------------------
-
-const ONE_DAY_MS = 24 * 60 * 60 * 1000;
-const MIN_VARIANCE_MINUTES = 5;
-const MAX_VARIANCE_MINUTES = 45;
-
-function rollVarianceMinutes(): number {
-  return (
-    Math.floor(
-      Math.random() * (MAX_VARIANCE_MINUTES - MIN_VARIANCE_MINUTES + 1)
-    ) + MIN_VARIANCE_MINUTES
-  );
-}
-
-interface ClaimState {
-  lastClaimAt: number | null;
-  nextClaimAt: number | null;
-  lastVarianceMinutes: number;
-  totalVarianceMinutes: number;
-  claimCount: number;
-}
-
-const EMPTY_STATE: ClaimState = {
-  lastClaimAt: null,
-  nextClaimAt: null,
-  lastVarianceMinutes: 0,
-  totalVarianceMinutes: 0,
-  claimCount: 0,
-};
-
-function storageKey(id: string) {
-  return `claim-board:${id}`;
-}
-
-function loadState(id: string): ClaimState {
-  if (typeof window === "undefined") return EMPTY_STATE;
-  try {
-    const raw = window.localStorage.getItem(storageKey(id));
-    if (!raw) return EMPTY_STATE;
-    return { ...EMPTY_STATE, ...JSON.parse(raw) };
-  } catch {
-    return EMPTY_STATE;
-  }
-}
-
-function saveState(id: string, state: ClaimState) {
-  if (typeof window === "undefined") return;
-  window.localStorage.setItem(storageKey(id), JSON.stringify(state));
-}
+const POLL_MS = 15_000;
 
 // ---------------------------------------------------------------------------
 // Formatting helpers
@@ -107,71 +38,136 @@ function formatCountdown(ms: number) {
   return `${pad(h)}:${pad(m)}:${pad(s)}`;
 }
 
-function formatMinutes(totalMinutes: number) {
-  if (totalMinutes <= 0) return "0m";
-  const h = Math.floor(totalMinutes / 60);
-  const m = totalMinutes % 60;
-  if (h === 0) return `${m}m`;
-  if (m === 0) return `${h}h`;
-  return `${h}h ${m}m`;
+function formatTimestamp(iso: string | null) {
+  if (!iso) return "Never";
+  const d = new Date(iso.endsWith("Z") ? iso : iso + "Z");
+  return d.toLocaleString(undefined, {
+    month: "short",
+    day: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+function isAlreadyClaimedError(error: string | null) {
+  return !!error && error.toLowerCase().includes("already claimed");
+}
+
+function isLikelyAuthError(status: string | null, error: string | null) {
+  if (status !== "Failed" || !error) return false;
+  if (isAlreadyClaimedError(error)) return false;
+  return (
+    error.includes("401") ||
+    error.includes("403") ||
+    error.toLowerCase().includes("unauthorized") ||
+    error.toLowerCase().includes("cookie")
+  );
 }
 
 // ---------------------------------------------------------------------------
-// Per-claim card
+// Status card
 // ---------------------------------------------------------------------------
 
-function ClaimCard({ config }: { config: ClaimConfig }) {
-  const [state, setState] = useState<ClaimState>(EMPTY_STATE);
-  const [hydrated, setHydrated] = useState(false);
-  const [now, setNow] = useState(() => Date.now());
-  const [loading, setLoading] = useState(false);
+function UpdateCookieForm({
+  accountId,
+  onUpdated,
+  onCancel,
+}: {
+  accountId: number;
+  onUpdated: () => void;
+  onCancel: () => void;
+}) {
+  const [value, setValue] = useState("");
+  const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [justClaimed, setJustClaimed] = useState(false);
-  const tickRef = useRef<number | null>(null);
 
-  useEffect(() => {
-    setState(loadState(config.id));
-    setHydrated(true);
-  }, [config.id]);
+  const handleSubmit = useCallback(
+    async (e: React.FormEvent) => {
+      e.preventDefault();
+      if (!value.trim() || submitting) return;
+      setSubmitting(true);
+      setError(null);
+      try {
+        const res = await fetch(`${baseurl}api/AutoClaim/updateCookie`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: accountId, cookie: value.trim() }),
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        setValue("");
+        onUpdated();
+      } catch (err) {
+        setError(err instanceof Error ? err.message : "Failed to save cookie");
+      } finally {
+        setSubmitting(false);
+      }
+    },
+    [accountId, value, submitting, onUpdated]
+  );
 
-  useEffect(() => {
-    tickRef.current = window.setInterval(() => setNow(Date.now()), 1000);
-    return () => {
-      if (tickRef.current) window.clearInterval(tickRef.current);
-    };
-  }, []);
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="border-t border-[#262F37] px-6 py-4"
+    >
+      <label className="mb-2 block text-[13px] text-[#8593A0]">
+        Paste the full Cookie header value from DevTools (Network tab →
+        request → Headers → Request Headers → Cookie).
+      </label>
+      <textarea
+        value={value}
+        onChange={(e) => setValue(e.target.value)}
+        rows={3}
+        placeholder="_ga=...; nifty_discord_access=...; nifty_discord_refresh=..."
+        className="w-full resize-none border border-[#262F37] bg-[#10151A] px-3 py-2 text-[13px] text-[#E7ECEF] placeholder:text-[#3A444D] focus:border-[#E3A23D] focus:outline-none"
+      />
+      {error && (
+        <div className="mt-2 text-[13px] text-[#D9695F]">{error}</div>
+      )}
+      <div className="mt-3 flex items-center gap-3">
+        <button
+          type="submit"
+          disabled={!value.trim() || submitting}
+          className={
+            "border px-4 py-2 text-[13px] font-medium transition-colors " +
+            (!value.trim() || submitting
+              ? "cursor-not-allowed border-[#262F37] text-[#3A444D]"
+              : "border-[#E3A23D] text-[#E3A23D] hover:bg-[#E3A23D] hover:text-[#171E24]")
+          }
+        >
+          {submitting ? "Saving…" : "Save cookie"}
+        </button>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="text-[13px] text-[#8593A0] hover:text-[#E7ECEF]"
+        >
+          Cancel
+        </button>
+      </div>
+    </form>
+  );
+}
 
-  const remainingMs = state.nextClaimAt ? state.nextClaimAt - now : 0;
-  const isReady = !state.nextClaimAt || remainingMs <= 0;
+function StatusCard({
+  account,
+  now,
+  onUpdated,
+}: {
+  account: AutoClaimStatus;
+  now: number;
+  onUpdated: () => void;
+}) {
+  const nextClaimMs = account.nextClaimAt
+    ? new Date(
+        account.nextClaimAt.endsWith("Z") ? account.nextClaimAt : account.nextClaimAt + "Z"
+      ).getTime()
+    : null;
 
-  const handleClaim = useCallback(async () => {
-    if (!isReady || loading) return;
-    setLoading(true);
-    setError(null);
-    try {
-      await config.api();
-
-      const variance = rollVarianceMinutes();
-      const claimedAt = Date.now();
-      const nextState: ClaimState = {
-        lastClaimAt: claimedAt,
-        nextClaimAt: claimedAt + ONE_DAY_MS + variance * 60_000,
-        lastVarianceMinutes: variance,
-        totalVarianceMinutes: state.totalVarianceMinutes + variance,
-        claimCount: state.claimCount + 1,
-      };
-      setState(nextState);
-      saveState(config.id, nextState);
-      setJustClaimed(true);
-      window.setTimeout(() => setJustClaimed(false), 2400);
-    } catch (err) {
-      setError(
-        err instanceof Error ? err.message : "Claim failed. Try again."
-      );
-    } finally {
-      setLoading(false);
-    }
-  }, [config, isReady, loading, state.totalVarianceMinutes, state.claimCount]);
+  const remainingMs = nextClaimMs ? nextClaimMs - now : 0;
+  const isReady = !nextClaimMs || remainingMs <= 0;
+  const needsAttention = isLikelyAuthError(account.lastStatus, account.lastError);
+  const [showForm, setShowForm] = useState(needsAttention);
 
   return (
     <div className="border border-[#262F37] bg-[#171E24]">
@@ -180,25 +176,31 @@ function ClaimCard({ config }: { config: ClaimConfig }) {
           <span
             className={
               "mt-0.5 h-2 w-2 shrink-0 rounded-full " +
-              (isReady ? "bg-[#E3A23D] animate-pulse" : "bg-[#3A444D]")
+              (needsAttention
+                ? "bg-[#D9695F]"
+                : isReady
+                ? "bg-[#E3A23D] animate-pulse"
+                : "bg-[#3A444D]")
             }
           />
           <div className="min-w-0">
             <div className="truncate text-[15px] font-medium text-[#E7ECEF]">
-              {config.name}
+              {account.projectName}
             </div>
             <div className="truncate text-[13px] text-[#8593A0]">
-              {config.description}
+              Auto-claim · daily
             </div>
           </div>
         </div>
 
         <div className="text-right">
-          {!hydrated ? (
-            <div className="text-[13px] text-[#8593A0]">—</div>
+          {needsAttention ? (
+            <div className="text-[13px] font-medium text-[#D9695F]">
+              Needs attention
+            </div>
           ) : isReady ? (
             <div className="text-[13px] font-medium tracking-wide text-[#E3A23D]">
-              Ready to claim
+              Claiming shortly
             </div>
           ) : (
             <div className="text-[22px] font-medium leading-none text-[#E7ECEF] [font-variant-numeric:tabular-nums]">
@@ -210,35 +212,40 @@ function ClaimCard({ config }: { config: ClaimConfig }) {
 
       <div className="flex items-center justify-between gap-6 border-t border-[#262F37] px-6 py-4">
         <div className="text-[13px] text-[#8593A0]">
-          {state.claimCount === 0 ? (
-            <span>No claims yet</span>
-          ) : (
-            <span>
-              +{state.lastVarianceMinutes}m variance last time · {formatMinutes(state.totalVarianceMinutes)} added across{" "}
-              {state.claimCount} {state.claimCount === 1 ? "claim" : "claims"}
-            </span>
+          {account.lastStreak != null && (
+            <span>Streak {account.lastStreak} · </span>
           )}
+          {account.lastReward != null && (
+            <span>+{account.lastReward} last reward · </span>
+          )}
+          <span>Last claimed {formatTimestamp(account.lastClaimAt)}</span>
         </div>
-
-        <button
-          onClick={handleClaim}
-          disabled={!hydrated || !isReady || loading}
-          className={
-            "shrink-0 border px-4 py-2 text-[13px] font-medium transition-colors " +
-            (!hydrated || !isReady
-              ? "cursor-not-allowed border-[#262F37] text-[#3A444D]"
-              : loading
-              ? "cursor-wait border-[#E3A23D] text-[#E3A23D]"
-              : "border-[#E3A23D] text-[#E3A23D] hover:bg-[#E3A23D] hover:text-[#171E24]")
-          }
-        >
-          {loading ? "Claiming…" : justClaimed ? "Claimed" : "Claim"}
-        </button>
       </div>
 
-      {error && (
+      {needsAttention && account.lastError && !showForm && (
         <div className="border-t border-[#262F37] px-6 py-3 text-[13px] text-[#D9695F]">
-          {error}
+          Session may have expired — refresh the stored cookie for this
+          account. ({account.lastError})
+        </div>
+      )}
+
+      {showForm ? (
+        <UpdateCookieForm
+          accountId={account.id}
+          onUpdated={() => {
+            setShowForm(false);
+            onUpdated();
+          }}
+          onCancel={() => setShowForm(false)}
+        />
+      ) : (
+        <div className="border-t border-[#262F37] px-6 py-3">
+          <button
+            onClick={() => setShowForm(true)}
+            className="text-[13px] text-[#8593A0] hover:text-[#E7ECEF]"
+          >
+            Update cookie
+          </button>
         </div>
       )}
     </div>
@@ -249,44 +256,83 @@ function ClaimCard({ config }: { config: ClaimConfig }) {
 // Page
 // ---------------------------------------------------------------------------
 
-export default function ClaimsPage() {
-  const [readyCount, setReadyCount] = useState(0);
+export default function AutoClaimStatusPage() {
+  const [accounts, setAccounts] = useState<AutoClaimStatus[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [now, setNow] = useState(() => Date.now());
+  const pollRef = useRef<number | null>(null);
+  const tickRef = useRef<number | null>(null);
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${baseurl}api/AutoClaim/status`);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: AutoClaimStatus[] = await res.json();
+      setAccounts(data);
+      setError(null);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to load status");
+    }
+  }, []);
 
   useEffect(() => {
-    const compute = () => {
-      const count = CLAIMS.reduce((acc, c) => {
-        const s = loadState(c.id);
-        const ready = !s.nextClaimAt || s.nextClaimAt - Date.now() <= 0;
-        return acc + (ready ? 1 : 0);
-      }, 0);
-      setReadyCount(count);
+    fetchStatus();
+    pollRef.current = window.setInterval(fetchStatus, POLL_MS);
+    tickRef.current = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => {
+      if (pollRef.current) window.clearInterval(pollRef.current);
+      if (tickRef.current) window.clearInterval(tickRef.current);
     };
-    compute();
-    const id = window.setInterval(compute, 1000);
-    return () => window.clearInterval(id);
-  }, []);
+  }, [fetchStatus]);
+
+  const readyCount = (accounts ?? []).filter((a) => {
+    if (!a.nextClaimAt) return true;
+    const ms =
+      new Date(a.nextClaimAt.endsWith("Z") ? a.nextClaimAt : a.nextClaimAt + "Z").getTime() -
+      now;
+    return ms <= 0;
+  }).length;
 
   return (
     <main className="min-h-screen bg-[#10151A] px-6 py-16">
       <div className="mx-auto w-full max-w-2xl">
         <div className="mb-8 flex items-baseline justify-between">
-          <h1 className="text-[20px] font-medium text-[#E7ECEF]">Claims</h1>
+          <h1 className="text-[20px] font-medium text-[#E7ECEF]">
+            Auto-claims
+          </h1>
           <div className="text-[13px] text-[#8593A0]">
-            {CLAIMS.length} tracked · {readyCount} ready
+            {accounts ? `${accounts.length} tracked · ${readyCount} claiming soon` : "—"}
           </div>
         </div>
 
+        {error && (
+          <div className="mb-4 border border-[#262F37] bg-[#171E24] px-6 py-4 text-[13px] text-[#D9695F]">
+            Couldn't reach the status endpoint. ({error})
+          </div>
+        )}
+
+        {!accounts && !error && (
+          <div className="border border-[#262F37] bg-[#171E24] px-6 py-8 text-center text-[13px] text-[#8593A0]">
+            Loading…
+          </div>
+        )}
+
+        {accounts && accounts.length === 0 && (
+          <div className="border border-[#262F37] bg-[#171E24] px-6 py-8 text-center text-[13px] text-[#8593A0]">
+            No accounts being tracked yet.
+          </div>
+        )}
+
         <div className="flex flex-col gap-3">
-          {CLAIMS.map((c) => (
-            <ClaimCard key={c.id} config={c} />
+          {accounts?.map((a) => (
+            <StatusCard key={a.id} account={a} now={now} onUpdated={fetchStatus} />
           ))}
         </div>
 
         <p className="mt-8 text-[13px] leading-relaxed text-[#8593A0]">
-          Each claim window is 24 hours plus a random {MIN_VARIANCE_MINUTES}–
-          {MAX_VARIANCE_MINUTES} minute delay added on every successful
-          claim, so the schedule keeps drifting instead of landing on the
-          same time each day.
+          Claims run automatically on the server on each project's real
+          schedule — this page is read-only and just reflects what already
+          happened or is coming up next.
         </p>
       </div>
     </main>
