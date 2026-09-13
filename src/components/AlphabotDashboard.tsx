@@ -8,6 +8,7 @@ interface PendingRaffle {
   slug: string
   name: string
   projectId: string
+  projectName: string | null
   endDate: number
 }
 
@@ -15,6 +16,7 @@ interface ResultRaffle {
   slug: string
   raffleName: string | null
   projectId: string | null
+  projectName: string | null
   success: boolean
   enteries: number
   reason: string | null
@@ -56,11 +58,11 @@ export default function AlphabotDashboard() {
     return () => clearInterval(interval)
   }, [fetchAll])
 
-  const handleReenter = async (slug: string, name: string | null, projectId: string | null) => {
+  const handleReenter = async (slug: string, name: string | null, projectId: string | null, projectName: string | null) => {
     setReenteringSlug(slug)
     try {
       await axios.post(`${baseurl}/api/Raffles/reenter/${slug}`, null, {
-        params: { name: name ?? "", projectId: projectId ?? "" },
+        params: { name: name ?? "", projectId: projectId ?? "", projectName: projectName ?? "" },
       })
       await fetchAll()
     } finally {
@@ -77,6 +79,13 @@ export default function AlphabotDashboard() {
       ...failed.map((r) => r.projectId ?? "unknown"),
     ])
   ).filter(Boolean) as string[]
+
+  const projectLabel = (pid: string): string => {
+    if (pid === "unknown") return "unknown"
+    const all = [...pending, ...successful, ...failed]
+    const match = all.find((r) => r.projectId === pid && r.projectName)
+    return match?.projectName || shortId(pid)
+  }
 
   const filterByProject = <T extends { projectId: string | null }>(list: T[]) =>
     activeProject === "all" ? list : list.filter((r) => (r.projectId ?? "unknown") === activeProject)
@@ -95,10 +104,11 @@ export default function AlphabotDashboard() {
   }
 
   const projectCount = (id: string) =>
-    (id === "all" ? pending.length + successful.length + failed.length :
-      pending.filter(r => r.projectId === id).length +
-      successful.filter(r => (r.projectId ?? "unknown") === id).length +
-      failed.filter(r => (r.projectId ?? "unknown") === id).length)
+    id === "all"
+      ? pending.length + successful.length + failed.length
+      : pending.filter((r) => r.projectId === id).length +
+        successful.filter((r) => (r.projectId ?? "unknown") === id).length +
+        failed.filter((r) => (r.projectId ?? "unknown") === id).length
 
   const statusBar = { pending: "bg-amber-400", successful: "bg-emerald-400", failed: "bg-rose-400" }
 
@@ -106,8 +116,7 @@ export default function AlphabotDashboard() {
 
   return (
     <div className="min-h-screen bg-[#0E0F13] text-[#E7E8ED] font-sans">
-      {/* Top bar */}
-      <div className="border-b border-[#242730] px-6 py-4 flex items-center justify-between">
+      <div className="border-b border-[#242730] px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         <div className="flex items-baseline gap-3">
           <h1 className="text-lg font-semibold tracking-tight">Alphabot Monitor</h1>
           <span className="flex items-center gap-1.5 text-xs text-[#8A8E9C]">
@@ -115,7 +124,7 @@ export default function AlphabotDashboard() {
             live
           </span>
         </div>
-        <div className="flex divide-x divide-[#242730] text-sm">
+        <div className="flex flex-wrap gap-x-4 divide-x divide-[#242730] text-sm">
           <Stat label="pending" value={pending.length} />
           <Stat label="entered" value={successful.length} />
           <Stat label="failed" value={failed.length} />
@@ -123,36 +132,34 @@ export default function AlphabotDashboard() {
         </div>
       </div>
 
-      <div className="flex">
-        {/* Sidebar */}
-        <div className="w-56 border-r border-[#242730] shrink-0 h-[calc(100vh-61px)] overflow-y-auto">
+      <div className="flex flex-col md:flex-row">
+        <div className="w-full md:w-56 shrink-0 border-b md:border-b-0 md:border-r border-[#242730] overflow-x-auto md:overflow-x-visible md:h-[calc(100vh-73px)] md:overflow-y-auto flex md:block">
           <button
             onClick={() => setActiveProject("all")}
-            className={`w-full text-left px-4 py-2.5 text-sm border-l-2 transition-colors ${
+            className={`shrink-0 text-left px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 transition-colors whitespace-nowrap ${
               activeProject === "all"
                 ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]"
                 : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
             }`}
           >
-            all projects <span className="float-right font-mono text-xs opacity-60">{projectCount("all")}</span>
+            all projects <span className="font-mono text-xs opacity-60 ml-2">{projectCount("all")}</span>
           </button>
           {projectIds.map((pid) => (
             <button
               key={pid}
               onClick={() => setActiveProject(pid)}
-              className={`w-full text-left px-4 py-2.5 text-sm border-l-2 font-mono transition-colors ${
+              className={`shrink-0 text-left px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 transition-colors whitespace-nowrap ${
                 activeProject === pid
                   ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]"
                   : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
               }`}
             >
-              {pid === "unknown" ? "unknown" : shortId(pid)}
-              <span className="float-right text-xs opacity-60">{projectCount(pid)}</span>
+              {projectLabel(pid)}
+              <span className="font-mono text-xs opacity-60 ml-2">{projectCount(pid)}</span>
             </button>
           ))}
         </div>
 
-        {/* Main */}
         <div className="flex-1 min-w-0">
           <div className="flex gap-6 px-6 pt-4 border-b border-[#242730]">
             {(["pending", "successful", "failed"] as Tab[]).map((tab) => (
@@ -160,9 +167,7 @@ export default function AlphabotDashboard() {
                 key={tab}
                 onClick={() => setActiveTab(tab)}
                 className={`pb-3 text-sm capitalize border-b-2 transition-colors ${
-                  activeTab === tab
-                    ? "border-[#7C6CF0] text-[#E7E8ED]"
-                    : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
+                  activeTab === tab ? "border-[#7C6CF0] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"
                 }`}
               >
                 {tab}
@@ -180,12 +185,14 @@ export default function AlphabotDashboard() {
                 filteredPending.map((r) => (
                   <div key={r.id} className="flex items-stretch">
                     <div className={`w-1 ${statusBar.pending}`} />
-                    <div className="flex-1 px-5 py-3 flex items-center justify-between">
-                      <div>
-                        <p className="text-sm">{r.name}</p>
-                        <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">{r.slug}</p>
+                    <div className="flex-1 px-5 py-3 flex items-center justify-between gap-4">
+                      <div className="min-w-0">
+                        <p className="text-sm truncate">{r.name}</p>
+                        <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
+                          {r.projectName || shortId(r.projectId)} · {r.slug}
+                        </p>
                       </div>
-                      <p className="text-xs font-mono text-amber-400">{timeLeft(r.endDate)} left</p>
+                      <p className="text-xs font-mono text-amber-400 shrink-0">{timeLeft(r.endDate)} left</p>
                     </div>
                   </div>
                 ))}
@@ -198,13 +205,13 @@ export default function AlphabotDashboard() {
                       <div className="min-w-0">
                         <p className="text-sm truncate">{r.raffleName ?? r.slug}</p>
                         <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
-                          {r.slug} · {new Date(r.enteredTime).toLocaleString()}
+                          {r.projectName || shortId(r.projectId ?? "")} · {new Date(r.enteredTime).toLocaleString()}
                         </p>
                       </div>
                       <div className="flex items-center gap-4 shrink-0">
                         <span className="text-xs font-mono text-emerald-400">{r.enteries} entries</span>
                         <button
-                          onClick={() => handleReenter(r.slug, r.raffleName, r.projectId)}
+                          onClick={() => handleReenter(r.slug, r.raffleName, r.projectId, r.projectName)}
                           disabled={reenteringSlug === r.slug}
                           className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40"
                         >
@@ -223,14 +230,14 @@ export default function AlphabotDashboard() {
                       <div className="min-w-0">
                         <p className="text-sm truncate">{r.raffleName ?? r.slug}</p>
                         <p className="text-xs text-[#8A8E9C] font-mono mt-0.5">
-                          {r.slug} · {new Date(r.enteredTime).toLocaleString()}
+                          {r.projectName || shortId(r.projectId ?? "")} · {new Date(r.enteredTime).toLocaleString()}
                         </p>
                         {(r.reason || r.error) && (
                           <p className="text-xs text-rose-400 mt-1 whitespace-pre-line">{r.reason || r.error}</p>
                         )}
                       </div>
                       <button
-                        onClick={() => handleReenter(r.slug, r.raffleName, r.projectId)}
+                        onClick={() => handleReenter(r.slug, r.raffleName, r.projectId, r.projectName)}
                         disabled={reenteringSlug === r.slug}
                         className="text-xs text-[#8A8E9C] hover:text-[#E7E8ED] transition-colors disabled:opacity-40 shrink-0"
                       >
