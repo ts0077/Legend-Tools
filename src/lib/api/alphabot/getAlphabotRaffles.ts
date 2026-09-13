@@ -15,7 +15,9 @@ export default async function AlphabotRafflesListApi (){
                             params:{
                                 token:alphabotKey,
                                 scope:"community",
-                                filter:"unregistered"
+                                filter:"unregistered",
+                                pageNum:0,
+                                sort:"ending"
                             }
                         }
                     ) 

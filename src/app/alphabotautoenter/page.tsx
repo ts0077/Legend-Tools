@@ -1,10 +1,13 @@
 'use client'
 import AlphabotRafflesListApi from "@/lib/api/alphabot/getAlphabotRaffles"
+import AlphabotRafflesRegisterResultApi, { raffleRegisterResultProps } from "@/lib/api/alphabot/registerAlphabotRaffleResult"
 import AlphabotRafflesRegisterApi from "@/lib/api/alphabot/registerforAlphabotRaffle"
+import { resolve } from "path"
 import { useState, useEffect } from "react"
 
 export default function AlphabotAutoEnter() {
   const [rafflesList, setRafflesList] = useState([])
+  const [slugList, setSlugList] = useState([])
   const [loading, setLoading] = useState(true)
 
   const handleAlphabotRafflesList = async () => {
@@ -13,6 +16,8 @@ export default function AlphabotAutoEnter() {
       const res = await AlphabotRafflesListApi()
       if (res.data.success === true) {
         setRafflesList(res?.data?.data?.raffles || [])
+        console.log(JSON.stringify(res?.data?.data?.raffles?.[0], null, 2))
+        setSlugList(res?.data?.data?.raffles.map((r:any)=>r.slug))
       } else {
         console.error("failed to load")
       }
@@ -26,7 +31,19 @@ export default function AlphabotAutoEnter() {
   const handleRegisterAlphabotRaffle = async(slug:string)=>{
     try{
             const res = await AlphabotRafflesRegisterApi (slug)
-            console.log(res)
+            const result12:raffleRegisterResultProps =  {
+              success: res?.data?.success === true,
+      validationSuccess: res?.data?.data?.validation?.success === true,
+              enteries:res?.data?.data?.validation?.entries  || 0,
+              reason: res?.data?.data?.validation?.reason || "",
+              resultMd: res?.data?.data?.resultMd || "",
+              error:res?.data?.errors?.[0]?.message  || "",
+              slug:slug
+            }
+      
+            
+            const res2 = await AlphabotRafflesRegisterResultApi(result12)
+            console.log(res2)
     }
     catch(error)
     {
@@ -34,9 +51,26 @@ export default function AlphabotAutoEnter() {
     }
   }
 
-//   useEffect(() => {
-//     handleAlphabotRafflesList()
-//   }, [])
+  useEffect(()=>{
+let cancelled = false
+
+const runSequentially = async()=>{
+  for(const slug of slugList)
+  {
+    if(cancelled) break
+    await handleRegisterAlphabotRaffle(slug);
+    await new Promise(resolve=>setTimeout(resolve,1000))
+  }
+}
+runSequentially()
+
+return()=>{
+  cancelled = true
+}
+  },[slugList])
+  
+
+
 
   return (
     <div className="bg-black/10 min-h-screen">
@@ -95,7 +129,23 @@ export default function AlphabotAutoEnter() {
               </div>
             )}
           </div>
-          <div></div>
+          <div className="border px-4 py-2">
+            {
+              slugList?.length>0?
+              slugList?.map((slug,index)=>(
+                <div className="mt-2 flex gap-2">
+                    {index} {slug}
+              </div>
+
+              ))
+                
+              :
+              <div>
+                Failed to load slugs 
+              </div>
+            }
+
+          </div>
         </div>
       </div>
     </div>
