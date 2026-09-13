@@ -22,6 +22,12 @@ interface AutoClaimStatus {
 
 const POLL_MS = 15_000;
 
+function apiUrl(path: string) {
+  const trimmedBase = baseurl?.endsWith("/") ? baseurl.slice(0, -1) : baseurl;
+  const trimmedPath = path.startsWith("/") ? path : `/${path}`;
+  return `${trimmedBase}${trimmedPath}`;
+}
+
 // ---------------------------------------------------------------------------
 // Formatting helpers
 // ---------------------------------------------------------------------------
@@ -88,7 +94,7 @@ function UpdateCookieForm({
       setSubmitting(true);
       setError(null);
       try {
-        const res = await fetch(`${baseurl}api/AutoClaim/updateCookie`, {
+        const res = await fetch(apiUrl("/api/AutoClaim/updateCookie"), {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ id: accountId, cookie: value.trim() }),
@@ -265,7 +271,7 @@ export default function AutoClaimStatusPage() {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch(`${baseurl}api/AutoClaim/status`);
+      const res = await fetch(apiUrl("/api/AutoClaim/status"));
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: AutoClaimStatus[] = await res.json();
       setAccounts(data);
