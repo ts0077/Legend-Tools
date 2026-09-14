@@ -99,6 +99,8 @@ export default function AlphabotDashboard() {
   const [queueingSlug, setQueueingSlug] = useState<string | null>(null)
   const [projectOrder, setProjectOrder] = useState<string[]>([])
   const [serverOrder, setServerOrder] = useState<string[]>([])
+  const [draggedKey, setDraggedKey] = useState<string | null>(null)
+  const [dragOverKey, setDragOverKey] = useState<string | null>(null)
 
   useEffect(() => {
     setSeenMap(loadSeenMap())
@@ -226,7 +228,6 @@ export default function AlphabotDashboard() {
     return [...ordered, ...unordered]
   }, [pending, successful, failed, groupMode, currentOrder])
 
-  // append any brand-new ids to the saved order so future moves persist correctly
   useEffect(() => {
     const missing = groupIds.filter((id) => !currentOrder.includes(id))
     if (missing.length > 0) {
@@ -243,6 +244,34 @@ export default function AlphabotDashboard() {
     const next = [...currentOrder]
     ;[next[idx], next[newIdx]] = [next[newIdx], next[idx]]
     persistOrder(next)
+  }
+
+  const reorderTo = (draggedId: string, targetId: string) => {
+    if (draggedId === targetId) return
+    const withoutDragged = currentOrder.filter((id) => id !== draggedId)
+    const targetIdx = withoutDragged.indexOf(targetId)
+    if (targetIdx === -1) return
+    const next = [...withoutDragged.slice(0, targetIdx), draggedId, ...withoutDragged.slice(targetIdx)]
+    persistOrder(next)
+  }
+
+  const handleDragStart = (key: string) => (e: React.DragEvent) => {
+    setDraggedKey(key)
+    e.dataTransfer.effectAllowed = "move"
+  }
+  const handleDragOver = (key: string) => (e: React.DragEvent) => {
+    e.preventDefault()
+    if (key !== dragOverKey) setDragOverKey(key)
+  }
+  const handleDrop = (key: string) => (e: React.DragEvent) => {
+    e.preventDefault()
+    if (draggedKey) reorderTo(draggedKey, key)
+    setDraggedKey(null)
+    setDragOverKey(null)
+  }
+  const handleDragEnd = () => {
+    setDraggedKey(null)
+    setDragOverKey(null)
   }
 
   const visibleGroupIds = groupIds.filter((key) =>
@@ -273,7 +302,6 @@ export default function AlphabotDashboard() {
       : pending.filter((r) => groupKey(r) === key).length + successful.filter((r) => groupKey(r) === key).length + failed.filter((r) => groupKey(r) === key).length
   const totalNew = newCountFor("all")
 
-  // unread counts scoped to the currently active group, per status tab
   const tabNewCount = (tab: StatusTab) => {
     const pCount = gPending.filter((r) => isNew(r.createdAt, groupKey(r))).length
     const sCount = gSuccessful.filter((r) => isNew(r.enteredTime, groupKey(r))).length
@@ -400,9 +428,22 @@ export default function AlphabotDashboard() {
               </div>
               {visibleGroupIds.map((key, idx) => {
                 const n = newCountFor(key)
+                const isDragging = draggedKey === key
+                const isOver = dragOverKey === key && draggedKey !== key
                 return (
-                  <div key={key} className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap gap-2 ${activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
+                  <div
+                    key={key}
+                    draggable
+                    onDragStart={handleDragStart(key)}
+                    onDragOver={handleDragOver(key)}
+                    onDrop={handleDrop(key)}
+                    onDragEnd={handleDragEnd}
+                    className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap gap-2 cursor-grab active:cursor-grabbing transition-colors ${
+                      activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"
+                    } ${isDragging ? "opacity-40" : ""} ${isOver ? "bg-[#1c1e27] border-t-2 border-t-[#7C6CF0]" : ""}`}
+                  >
                     <button onClick={() => setActiveGroup(key)} className="hover:text-[#E7E8ED] flex items-center gap-2 min-w-0">
+                      <span className="text-[#4a4d57] select-none">⋮⋮</span>
                       <span className="truncate">{groupLabel(key)}</span>
                       <span className="font-mono text-xs opacity-60 shrink-0">{groupCount(key)}</span>
                       {n > 0 && <span className="shrink-0"><Badge n={n} /></span>}
