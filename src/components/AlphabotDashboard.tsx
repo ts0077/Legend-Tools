@@ -43,6 +43,7 @@ type StatusTab = "all" | "pending" | "successful" | "failed"
 type GroupMode = "project" | "server" | "community"
 
 const SEEN_KEY = "alphabot_seen_map_v2"
+const ORDER_KEY_PREFIX = "alphabot_order_"
 
 function loadSeenMap(): Record<string, number> {
   if (typeof window === "undefined") return {}
@@ -53,6 +54,15 @@ function loadSeenMap(): Record<string, number> {
   const initial = { global: Date.now() }
   localStorage.setItem(SEEN_KEY, JSON.stringify(initial))
   return initial
+}
+
+function loadOrder(mode: string): string[] {
+  if (typeof window === "undefined") return []
+  try {
+    const raw = localStorage.getItem(ORDER_KEY_PREFIX + mode)
+    if (raw) return JSON.parse(raw)
+  } catch {}
+  return []
 }
 
 function formatDuration(ms: number) {
@@ -82,12 +92,19 @@ export default function AlphabotDashboard() {
   const [seenMap, setSeenMap] = useState<Record<string, number>>({})
   const [etaSeconds, setEtaSeconds] = useState<number | null>(null)
   const [search, setSearch] = useState("")
+  const [sidebarSearch, setSidebarSearch] = useState("")
   const [fullList, setFullList] = useState<FullRaffle[] | null>(null)
   const [fullListLoading, setFullListLoading] = useState(false)
   const [fullListError, setFullListError] = useState<string | null>(null)
   const [queueingSlug, setQueueingSlug] = useState<string | null>(null)
+  const [projectOrder, setProjectOrder] = useState<string[]>([])
+  const [serverOrder, setServerOrder] = useState<string[]>([])
 
-  useEffect(() => { setSeenMap(loadSeenMap()) }, [])
+  useEffect(() => {
+    setSeenMap(loadSeenMap())
+    setProjectOrder(loadOrder("project"))
+    setServerOrder(loadOrder("server"))
+  }, [])
 
   const fetchAll = useCallback(async () => {
     try {
@@ -193,20 +210,44 @@ export default function AlphabotDashboard() {
     return match?.projectName || shortId(key)
   }
 
-  // latest activity timestamp per group, for recency sort
-  const latestActivity = useMemo(() => {
-    const map: Record<string, number> = {}
-    const bump = (key: string, ts: number) => { if (!map[key] || ts > map[key]) map[key] = ts }
-    pending.forEach((r) => bump(groupKey(r), new Date(r.createdAt).getTime()))
-    successful.forEach((r) => bump(groupKey(r), new Date(r.enteredTime).getTime()))
-    failed.forEach((r) => bump(groupKey(r), new Date(r.enteredTime).getTime()))
-    return map
-  }, [pending, successful, failed, groupMode])
+  const currentOrder = groupMode === "server" ? serverOrder : projectOrder
+  const setCurrentOrder = groupMode === "server" ? setServerOrder : setProjectOrder
+  const orderKey = groupMode === "server" ? "server" : "project"
+
+  const persistOrder = (order: string[]) => {
+    localStorage.setItem(ORDER_KEY_PREFIX + orderKey, JSON.stringify(order))
+    setCurrentOrder(order)
+  }
 
   const groupIds = useMemo(() => {
-    const ids = Array.from(new Set([...pending, ...successful, ...failed].map(groupKey))).filter(Boolean)
-    return ids.sort((a, b) => (latestActivity[b] ?? 0) - (latestActivity[a] ?? 0))
-  }, [pending, successful, failed, groupMode, latestActivity])
+    const rawIds = Array.from(new Set([...pending, ...successful, ...failed].map(groupKey))).filter(Boolean)
+    const ordered = currentOrder.filter((id) => rawIds.includes(id))
+    const unordered = rawIds.filter((id) => !currentOrder.includes(id))
+    return [...ordered, ...unordered]
+  }, [pending, successful, failed, groupMode, currentOrder])
+
+  // append any brand-new ids to the saved order so future moves persist correctly
+  useEffect(() => {
+    const missing = groupIds.filter((id) => !currentOrder.includes(id))
+    if (missing.length > 0) {
+      persistOrder([...currentOrder, ...missing])
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groupIds.join(",")])
+
+  const moveGroup = (key: string, direction: -1 | 1) => {
+    const idx = currentOrder.indexOf(key)
+    if (idx === -1) return
+    const newIdx = idx + direction
+    if (newIdx < 0 || newIdx >= currentOrder.length) return
+    const next = [...currentOrder]
+    ;[next[idx], next[newIdx]] = [next[newIdx], next[idx]]
+    persistOrder(next)
+  }
+
+  const visibleGroupIds = groupIds.filter((key) =>
+    !sidebarSearch.trim() || groupLabel(key).toLowerCase().includes(sidebarSearch.toLowerCase())
+  )
 
   const inGroup = <T extends { projectId: string | null; teamId?: string | null }>(list: T[]) =>
     activeGroup === "all" ? list : list.filter((r) => groupKey(r) === activeGroup)
@@ -232,6 +273,17 @@ export default function AlphabotDashboard() {
       : pending.filter((r) => groupKey(r) === key).length + successful.filter((r) => groupKey(r) === key).length + failed.filter((r) => groupKey(r) === key).length
   const totalNew = newCountFor("all")
 
+  // unread counts scoped to the currently active group, per status tab
+  const tabNewCount = (tab: StatusTab) => {
+    const pCount = gPending.filter((r) => isNew(r.createdAt, groupKey(r))).length
+    const sCount = gSuccessful.filter((r) => isNew(r.enteredTime, groupKey(r))).length
+    const fCount = gFailed.filter((r) => isNew(r.enteredTime, groupKey(r))).length
+    if (tab === "pending") return pCount
+    if (tab === "successful") return sCount
+    if (tab === "failed") return fCount
+    return pCount + sCount + fCount
+  }
+
   type MergedRow = { key: string; title: string; slug: string; status: "pending" | "entered" | "failed"; groupLabel: string; groupId: string; timestamp: number; entries?: number; reason?: string | null }
 
   const mergedAll: MergedRow[] = useMemo(() => {
@@ -254,6 +306,9 @@ export default function AlphabotDashboard() {
   const statusText = { pending: "text-amber-400", entered: "text-emerald-400", failed: "text-rose-400" }
   const fullListFiltered = (fullList ?? []).filter((r) => matchesSearch(r.name, r.slug))
 
+  const Badge = ({ n }: { n: number }) =>
+    n > 0 ? <span className="text-[10px] bg-[#7C6CF0] text-white px-1.5 py-0.5 rounded-full font-mono">{n}</span> : null
+
   return (
     <div className="min-h-screen bg-[#0E0F13] text-[#E7E8ED] font-sans">
       <div className="border-b border-[#242730] px-6 py-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -263,7 +318,7 @@ export default function AlphabotDashboard() {
             <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
             live
           </span>
-          {totalNew > 0 && <span className="text-xs bg-[#7C6CF0] text-white px-1.5 py-0.5 rounded-full font-mono">{totalNew} new</span>}
+          {totalNew > 0 && <Badge n={totalNew} />}
           {etaSeconds !== null && pending.length > 0 && <span className="text-xs text-[#8A8E9C] font-mono">next entry in {formatSeconds(etaSeconds)}</span>}
         </div>
         <div className="flex items-center gap-4">
@@ -331,31 +386,49 @@ export default function AlphabotDashboard() {
         </div>
       ) : (
         <div className="flex flex-col md:flex-row">
-          <div className="w-full md:w-60 shrink-0 border-b md:border-b-0 md:border-r border-[#242730] overflow-x-auto md:overflow-x-visible md:h-[calc(100vh-113px)] md:overflow-y-auto flex md:block">
-            <div className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap ${activeGroup === "all" ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
-              <button onClick={() => setActiveGroup("all")} className="hover:text-[#E7E8ED]">
-                all {groupMode === "server" ? "servers" : "projects"}<span className="font-mono text-xs opacity-60 ml-2">{groupCount("all")}</span>
-              </button>
+          <div className="w-full md:w-64 shrink-0 border-b md:border-b-0 md:border-r border-[#242730] md:h-[calc(100vh-113px)] flex flex-col">
+            <div className="px-3 py-2 border-b border-[#242730]">
+              <input value={sidebarSearch} onChange={(e) => setSidebarSearch(e.target.value)}
+                placeholder={`search ${groupMode === "server" ? "servers" : "projects"}…`}
+                className="w-full bg-[#15171E] border border-[#242730] text-xs px-2.5 py-1.5 rounded focus:outline-none focus:border-[#7C6CF0]" />
             </div>
-            {groupIds.map((key) => {
-              const n = newCountFor(key)
-              return (
-                <div key={key} className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap ${activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
-                  <button onClick={() => setActiveGroup(key)} className="hover:text-[#E7E8ED] flex items-center gap-2">
-                    {groupLabel(key)}<span className="font-mono text-xs opacity-60">{groupCount(key)}</span>
-                    {n > 0 && <span className="text-[10px] bg-[#7C6CF0] text-white px-1 rounded-full font-mono">{n}</span>}
-                  </button>
-                  {n > 0 && <button onClick={() => markGroupRead(key)} className="text-[10px] text-[#8A8E9C] hover:text-[#E7E8ED] ml-2">read</button>}
-                </div>
-              )
-            })}
+            <div className="overflow-x-auto md:overflow-x-visible md:overflow-y-auto flex md:block flex-1">
+              <div className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap ${activeGroup === "all" ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
+                <button onClick={() => setActiveGroup("all")} className="hover:text-[#E7E8ED]">
+                  all {groupMode === "server" ? "servers" : "projects"}<span className="font-mono text-xs opacity-60 ml-2">{groupCount("all")}</span>
+                </button>
+              </div>
+              {visibleGroupIds.map((key, idx) => {
+                const n = newCountFor(key)
+                return (
+                  <div key={key} className={`shrink-0 flex items-center justify-between px-4 py-2.5 text-sm border-b-2 md:border-b-0 md:border-l-2 whitespace-nowrap gap-2 ${activeGroup === key ? "border-[#7C6CF0] bg-[#15171E] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C]"}`}>
+                    <button onClick={() => setActiveGroup(key)} className="hover:text-[#E7E8ED] flex items-center gap-2 min-w-0">
+                      <span className="truncate">{groupLabel(key)}</span>
+                      <span className="font-mono text-xs opacity-60 shrink-0">{groupCount(key)}</span>
+                      {n > 0 && <span className="shrink-0"><Badge n={n} /></span>}
+                    </button>
+                    <div className="flex items-center gap-1 shrink-0">
+                      {n > 0 && <button onClick={() => markGroupRead(key)} className="text-[10px] text-[#8A8E9C] hover:text-[#E7E8ED]">read</button>}
+                      <button onClick={() => moveGroup(key, -1)} disabled={idx === 0} className="text-[#8A8E9C] hover:text-[#E7E8ED] disabled:opacity-20 disabled:cursor-default px-1">↑</button>
+                      <button onClick={() => moveGroup(key, 1)} disabled={idx === visibleGroupIds.length - 1} className="text-[#8A8E9C] hover:text-[#E7E8ED] disabled:opacity-20 disabled:cursor-default px-1">↓</button>
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           </div>
 
           <div className="flex-1 min-w-0">
             <div className="flex gap-6 px-6 pt-4 border-b border-[#242730] overflow-x-auto">
-              {(["all", "pending", "successful", "failed"] as StatusTab[]).map((tab) => (
-                <button key={tab} onClick={() => setActiveTab(tab)} className={`pb-3 text-sm capitalize border-b-2 transition-colors whitespace-nowrap ${activeTab === tab ? "border-[#7C6CF0] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"}`}>{tab}</button>
-              ))}
+              {(["all", "pending", "successful", "failed"] as StatusTab[]).map((tab) => {
+                const n = tabNewCount(tab)
+                return (
+                  <button key={tab} onClick={() => setActiveTab(tab)} className={`pb-3 text-sm capitalize border-b-2 transition-colors whitespace-nowrap flex items-center gap-2 ${activeTab === tab ? "border-[#7C6CF0] text-[#E7E8ED]" : "border-transparent text-[#8A8E9C] hover:text-[#E7E8ED]"}`}>
+                    {tab}
+                    {n > 0 && <Badge n={n} />}
+                  </button>
+                )
+              })}
             </div>
             <div className="px-6 pt-3">
               <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="search by name or slug…"
